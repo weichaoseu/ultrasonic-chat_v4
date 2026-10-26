@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>声波聊天 · 手机端</title>
+<style>
+  :root{ --bg:#0f1420; --panel:#1a2233; --line:#2a3448; --txt:#e6edf7; --dim:#8a97ad; --acc:#3fb6ff; --ok:#3fd68f; --warn:#ffb454; --err:#ff6b6b; }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; }
+  body{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); display:flex; flex-direction:column; }
+  header{ padding:10px 14px; border-bottom:1px solid var(--line); background:var(--panel); }
+  .top{ display:flex; align-items:center; gap:10px; }
+  .dot{ width:9px; height:9px; border-radius:50%; background:#5a6577; flex:none; }
+  .dot.on{ background:var(--ok); box-shadow:0 0 6px var(--ok); }
+  h1{ font-size:16px; margin:0; flex:1; font-weight:600; }
+  button{ cursor:pointer; }
+  #connBtn{ background:var(--acc); color:#04121f; border:none; border-radius:7px; padding:7px 14px; font-size:13px; font-weight:600; }
+  #connBtn:disabled{ opacity:.5; cursor:default; }
+  .bar{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:8px; font-size:12px; color:var(--dim); }
+  select, input[type=range]{ accent-color:var(--acc); }
+  select{ background:#0c1220; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:4px 6px; font-size:12.5px; }
+  .mini{ background:#2a3448; color:var(--txt); border:none; border-radius:6px; padding:5px 10px; font-size:12px; }
+  #statusText{ font-size:11.5px; color:var(--dim); margin-top:7px; min-height:15px; }
+
+  #chat{ flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
+  .msg{ display:flex; flex-direction:column; max-width:80%; }
+  .msg.me{ align-self:flex-end; align-items:flex-end; }
+  .msg.peer{ align-self:flex-start; align-items:flex-start; }
+  .bubble{ padding:9px 13px; border-radius:15px; font-size:14px; word-break:break-word; white-space:pre-wrap; line-height:1.5; }
+  .me .bubble{ background:var(--acc); color:#04121f; border-bottom-right-radius:4px; }
+  .peer .bubble{ background:#2a3448; color:var(--txt); border-bottom-left-radius:4px; }
+  .bubble.fail{ background:#7a2b38; color:#ffd7dc; }
+  .bubble.warn{ background:#3a2d14; color:#ffd9a0; }
+  .meta{ font-size:10.5px; color:var(--dim); margin-top:3px; padding:0 4px; }
+
+  footer{ display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--line); background:var(--panel); align-items:flex-end; }
+  #msgInput{ flex:1; resize:none; max-height:120px; background:#0c1220; border:1px solid var(--line); color:var(--txt); border-radius:9px; padding:10px 12px; font-size:15px; font-family:inherit; line-height:1.4; }
+  #sendBtn{ background:var(--acc); color:#04121f; border:none; border-radius:9px; padding:11px 16px; font-size:14px; font-weight:600; }
+  .hint{ font-size:11px; color:var(--dim); margin-top:4px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <span class="dot" id="connDot"></span>
+    <h1>🔊 声波聊天 · 手机端</h1>
+    <button id="connBtn">连接</button>
+  </div>
+  <div class="bar">
+    <span>协议</span>
+    <select id="protoSel">
+      <option value="0">可闻·标准（最稳，有声）</option>
+      <option value="1">可闻·快</option>
+      <option value="2">可闻·极速</option>
+      <option value="3" selected>超声·标准（约18kHz）</option>
+      <option value="4">超声·快</option>
+      <option value="5">超声·极速</option>
+    </select>
+    <span>音量</span>
+    <input type="range" id="volRange" min="0" max="100" value="60" style="width:90px">
+    <button id="testBtn" class="mini">自测</button>
+  </div>
+  <div id="statusText">未连接 —— 点右上角「连接」授权麦克风</div>
+  <div class="hint">两端「协议」必须一致。若超声不稳，可切换到「可闻」系列（更稳，但能听到调制声）。</div>
+</header>
+
+<main id="chat"></main>
+
+<footer>
+  <textarea id="msgInput" rows="1" placeholder="输入消息…（约 140 字节 / 46 汉字以内）"></textarea>
+  <button id="sendBtn">发送</button>
+</footer>
+
+<script src="ggwave.js"></script>
+<script>
+"use strict";
+/* 基于 GGWave（https://github.com/ggerganov/ggwave）的声波数据传输引擎，
+ * 协议 API 调用方式参照 Benn Jordan 的 Wavest 项目已验证的写法。 */
+
+// ===== 状态 =====
+let ggwave = null, ggwaveInstance = null;
+let audioCtx = null, micStream = null, processor = null;
+let connected = false, txBusy = false, deafUntil = 0, lastEnergy = 0;
+let sending = false;      // 是否正在「发送 + 等回执」流程中
+let ackResolve = null;    // 等待 ACK 的回调
+const ACK_MARK = '#ACK#'; // 回执保留标记
+
+const PROTO_KEYS = [
+  'GGWAVE_PROTOCOL_AUDIBLE_NORMAL',
+  'GGWAVE_PROTOCOL_AUDIBLE_FAST',
+  'GGWAVE_PROTOCOL_AUDIBLE_FASTEST',
+  'GGWAVE_PROTOCOL_ULTRASOUND_NORMAL',
+  'GGWAVE_PROTOCOL_ULTRASOUND_FAST',
+  'GGWAVE_PROTOCOL_ULTRASOUND_FASTEST',
+];
+
+function convertTypedArray(src, type){
+  const buffer = new ArrayBuffer(src.byteLength);
+  new src.constructor(buffer).set(src);
+  return new type(buffer);
+}
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function protoId(){ return ggwave.ProtocolId[PROTO_KEYS[parseInt(protoSel.value)]]; }
+
+// 应用层 CRC-32：GGWave 的 RS 只纠错、不保证检出「误纠」，这里再加一道校验防静默错码
+function crc32(bytes){
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++){
+    crc ^= bytes[i];
+    for (let k = 0; k < 8; k++) crc = (crc >>> 1) ^ (0xEDB88320 & -(crc & 1));
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+function crc32Hex(str){ return crc32(new TextEncoder().encode(str)).toString(16).padStart(8, '0'); }
+function packMessage(text){ return crc32Hex(text) + ':' + text; }
+function unpackMessage(raw){
+  if (raw.length < 9 || raw.charAt(8) !== ':') return { ok: false };
+  const text = raw.substring(9);
+  if (crc32Hex(text) !== raw.substring(0, 8).toLowerCase()) return { ok: false };
+  return { ok: true, text };
+}
+
+async function initEngine(){
+  if (ggwave) return;
+  if (typeof ggwave_factory === 'undefined') throw new Error('ggwave.js 未加载');
+  ggwave = await ggwave_factory();
+}
+
+// ===== 连接（音频 + 引擎 + 麦克风） =====
+async function connect(){
+  await initEngine();
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  await audioCtx.resume();
+  const p = ggwave.getDefaultParameters();
+  p.sampleRateInp = audioCtx.sampleRate;
+  p.sampleRateOut = audioCtx.sampleRate;
+  ggwaveInstance = ggwave.init(p);
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }
+  });
+  const src = audioCtx.createMediaStreamSource(micStream);
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  const mute = audioCtx.createGain(); mute.gain.value = 0;   // 静音节点防回授
+  src.connect(processor); processor.connect(mute); mute.connect(audioCtx.destination);
+  processor.onaudioprocess = onAudio;
+  connected = true;
+  connDot.classList.add('on');
+  connBtn.textContent = '已连接'; connBtn.disabled = true;
+  setStatus('已连接，可收发消息');
+}
+
+// ===== 接收 =====
+function onAudio(e){
+  const data = e.inputBuffer.getChannelData(0);
+  const now = performance.now();
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+  if (Math.sqrt(sum / data.length) > 0.004) lastEnergy = now;   // 载波侦听
+  if (now < deafUntil || txBusy) return;                        // 半双工：发送时不解码
+  const bytes = ggwave.decode(ggwaveInstance, convertTypedArray(data, Int8Array));
+  if (bytes && bytes.length > 0){
+    const res = unpackMessage(new TextDecoder('utf-8').decode(bytes));
+    if (res.ok){
+      if (res.text === ACK_MARK){
+        if (ackResolve){ ackResolve(true); ackResolve = null; }   // 收到对方回执
+      } else {
+        addMsg(res.text, 'peer');
+        sendAck();   // 回执确认
+      }
+    } else {
+      addMsg('⚠ 收到损坏的消息，已丢弃', 'peer', 'CRC 校验失败', 'warn');
+    }
+  }
+}
+
+// ===== 发送 =====
+function playWaveform(floatArr){
+  return new Promise((resolve) => {
+    const buf = audioCtx.createBuffer(1, floatArr.length, audioCtx.sampleRate);
+    buf.getChannelData(0).set(floatArr);
+    const src = audioCtx.createBufferSource(); src.buffer = buf;
+    src.connect(audioCtx.destination);
+    txBusy = true;
+    deafUntil = performance.now() + (floatArr.length / audioCtx.sampleRate) * 1000 + 200;
+    src.onended = () => { txBusy = false; resolve(); };
+    src.start();
+  });
+}
+
+async function carrierSense(){
+  const deadline = performance.now() + 2000;
+  while (performance.now() < deadline){
+    if (!connected) return;
+    if (performance.now() - lastEnergy > 350) return;   // 信道已静默
+    await sleep(60);
+  }
+}
+
+function waitForAck(timeoutMs){
+  return new Promise(resolve => {
+    ackResolve = resolve;
+    setTimeout(() => { if (ackResolve){ ackResolve(false); ackResolve = null; } }, timeoutMs);
+  });
+}
+
+async function sendAck(){
+  await sleep(120);   // 稍等，避免与对方发送尾音冲突
+  const wf = ggwave.encode(ggwaveInstance, packMessage(ACK_MARK), protoId(), parseInt(volRange.value));
+  if (wf && wf.length > 0){
+    try{ await playWaveform(convertTypedArray(wf, Float32Array)); }catch(e){}
+  }
+}
+
+async function doSend(text){
+  if (!connected){ setStatus('尚未连接，点右上角「连接」'); return; }
+  if (sending || txBusy){ setStatus('上一消息还在发送…'); return; }
+  if (!text.trim()) return;
+  const packed = packMessage(text);
+  const bytes = new TextEncoder().encode(packed);
+  if (bytes.length > 140){ setStatus('消息太长（约 140 字节 / 46 汉字以内）'); return; }
+  await carrierSense();
+  const wf = ggwave.encode(ggwaveInstance, packed, protoId(), parseInt(volRange.value));
+  if (!wf || wf.length === 0){ setStatus('编码失败，消息可能太长'); return; }
+  sending = true;
+  const bubble = addMsg(text, 'me', '发送中…');
+  try{
+    await playWaveform(convertTypedArray(wf, Float32Array));
+    bubble.setStatus('等待回执…');
+    const ack = await waitForAck(3000);
+    if (ack) bubble.setStatus('已送达 ✓');
+    else { bubble.setStatus('未送达 ✗（超时）'); bubble.markFail(); }
+  }catch(err){
+    bubble.setStatus('发送失败 ✗'); bubble.markFail();
+  }
+  sending = false;
+}
+
+// ===== 自测（本地回环，验证引擎） =====
+async function selfTest(){
+  try{
+    await initEngine();
+    const p = ggwave.getDefaultParameters();
+    p.sampleRateInp = 48000; p.sampleRateOut = 48000;
+    const inst = ggwave.init(p);
+    const payload = 'HELLO-123';
+    const wf = ggwave.encode(inst, packMessage(payload), protoId(), 60);
+    const int8 = convertTypedArray(convertTypedArray(wf, Float32Array), Int8Array);
+    const decoded = ggwave.decode(inst, int8);
+    const res = decoded ? unpackMessage(new TextDecoder('utf-8').decode(decoded)) : null;
+    const ok = res && res.ok && res.text === payload;
+    setStatus(ok ? '自测通过 ✓（引擎+CRC 正常）' : '自测失败 ✗');
+  }catch(e){ setStatus('自测出错：' + e.message); }
+}
+
+// ===== 聊天 UI =====
+function addMsg(text, who, statusText, bubbleClass){
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + (who === 'me' ? 'me' : 'peer');
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble' + (bubbleClass ? ' ' + bubbleClass : '');
+  bubble.textContent = text;
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const time = new Date().toTimeString().slice(0, 8);
+  meta.textContent = time + (statusText ? ' · ' + statusText : '');
+  wrap.appendChild(bubble); wrap.appendChild(meta);
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+  return {
+    setStatus(s){ meta.textContent = time + ' · ' + s; },
+    markFail(){ bubble.classList.add('fail'); }
+  };
+}
+function setStatus(msg, cls){
+  statusText.textContent = msg;
+  statusText.style.color = cls === 'warn' ? 'var(--warn)' : (cls === 'err' ? 'var(--err)' : 'var(--dim)');
+}
+
+// ===== DOM 引用 + 绑定 =====
+const connDot = document.getElementById('connDot');
+const connBtn = document.getElementById('connBtn');
+const protoSel = document.getElementById('protoSel');
+const volRange = document.getElementById('volRange');
+const statusText = document.getElementById('statusText');
+const chat = document.getElementById('chat');
+const msgInput = document.getElementById('msgInput');
+
+connBtn.addEventListener('click', () => {
+  connect().catch(e => setStatus('连接失败：' + e.message + '（需 HTTPS/localhost）', 'err'));
+});
+document.getElementById('testBtn').addEventListener('click', () => selfTest());
+document.getElementById('sendBtn').addEventListener('click', () => {
+  const v = msgInput.value; msgInput.value = '';
+  doSend(v);
+});
+msgInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); const v = msgInput.value; msgInput.value = ''; doSend(v); }
+});
+
+setStatus('加载 GGWave 引擎…');
+if (typeof ggwave_factory !== 'undefined'){
+  initEngine().then(() => setStatus('引擎就绪，点右上角「连接」')).catch(e => setStatus('引擎加载失败：' + e.message, 'err'));
+} else {
+  setStatus('错误：ggwave.js 未加载', 'err');
+}
+addMsg('对方发送的消息会显示在这里', 'peer');
+</script>
+</body>
+</html>
